@@ -119,6 +119,21 @@ class Pipeline:
             log.info("neutral pose captured (%s)", source)
             await self._notify_status()
 
+    async def set_deadzone(self, imu, deg) -> None:
+        self.tracker.set_deadzone(imu, deg)
+        log.info("deadzone updated: imu=%s deg=%.1f", imu, float(deg))
+        await self._notify_status()
+
+    async def reset_deadzones(self) -> None:
+        self.tracker.reset_deadzones()
+        log.info("deadzones reset to defaults")
+        await self._notify_status()
+
+    async def set_mount(self, yaw_deg, invert_yaw, invert_pitch, invert_roll) -> None:
+        self.tracker.set_mount(yaw_deg, invert_yaw, invert_pitch, invert_roll)
+        log.info("mount updated: %s", self.tracker.mount)
+        await self._notify_status()
+
     # -- ingest -------------------------------------------------------------
 
     async def ingest_frame(self, frame) -> None:
@@ -156,6 +171,8 @@ class Pipeline:
             "zeroed_at": t.zeroed_at,
             "zero_source": t.zero_source,
             "rate_hz": round(self._rate_hz, 2),
+            "deadzones_deg": list(t.deadzones_deg),
+            "mount": t.mount,
         }
 
     async def _notify_status(self) -> None:
@@ -339,6 +356,23 @@ class WsHub:
                 kind = msg.get("type")
                 if kind == "zero":
                     await self.pipeline.zero("user")
+                elif kind == "set_deadzone":
+                    try:
+                        await self.pipeline.set_deadzone(msg.get("imu"), msg.get("deg"))
+                    except ValueError as exc:
+                        await ws.send(json.dumps({"type": "error", "message": str(exc)}))
+                elif kind == "reset_deadzones":
+                    await self.pipeline.reset_deadzones()
+                elif kind == "set_mount":
+                    try:
+                        await self.pipeline.set_mount(
+                            msg.get("yaw_deg"),
+                            msg.get("invert_yaw"),
+                            msg.get("invert_pitch"),
+                            msg.get("invert_roll"),
+                        )
+                    except ValueError as exc:
+                        await ws.send(json.dumps({"type": "error", "message": str(exc)}))
                 elif kind == "ping":
                     await ws.send(json.dumps({"type": "pong", "t": time.time()}))
         except ConnectionClosed:

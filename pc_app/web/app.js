@@ -30,7 +30,12 @@ function fail(msg) {
 const $ = (id) => document.getElementById(id);
 const dotEl = $("dot"), statusTxt = $("statusTxt"), hzTxt = $("hzTxt"),
       fpsTxt = $("fpsTxt"), imuCountEl = $("imuCount"), zeroTxt = $("zeroTxt"),
-      zeroBtn = $("zeroBtn"), resetBtn = $("resetBtn"), errEl = $("err");
+      zeroBtn = $("zeroBtn"), resetBtn = $("resetBtn"), errEl = $("err"),
+      imuSelect = $("imuSelect"), deadzoneSlider = $("deadzoneSlider"),
+      deadzoneValue = $("deadzoneValue"), jitterReadout = $("jitterReadout"),
+      resetDeadzonesBtn = $("resetDeadzonesBtn"), mountYawSelect = $("mountYaw"),
+      invertYawInput = $("invertYaw"), invertRollInput = $("invertRoll"),
+      invertPitchInput = $("invertPitch");
 
 const WS_URL = "ws://" + location.hostname + ":8765";
 const JOINT_NAMES = [
@@ -206,8 +211,65 @@ function setSensors(health) {
 // --- WebSocket ----------------------------------------------------------------
 let ws = null;
 let lastPoseAt = 0;
+let deadzonesDeg = Array(11).fill(0.8);
+let lastJitterDeg = Array(11).fill(0);
+let mountSettings = {
+  yaw_deg: 180,
+  invert_yaw: false,
+  invert_pitch: false,
+  invert_roll: false,
+};
 const targets = { hand: new THREE.Quaternion(), joints: {} };
 let connectionState = "offline";   // offline | connecting | connected
+
+function sendCommand(command) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(command));
+}
+
+function updateJitterReadout() {
+  const selected = imuSelect.value;
+  if (selected === "all") {
+    jitterReadout.textContent = `${Math.max(...lastJitterDeg).toFixed(2)}° max`;
+  } else {
+    jitterReadout.textContent = `${(lastJitterDeg[Number(selected)] ?? 0).toFixed(2)}°`;
+  }
+}
+
+function syncDeadzoneControls() {
+  const selected = imuSelect.value;
+  if (selected === "all") {
+    const first = deadzonesDeg[0] ?? 0.8;
+    const uniform = deadzonesDeg.every((value) => Math.abs(value - first) < 1e-6);
+    if (uniform) {
+      deadzoneSlider.value = first;
+      deadzoneValue.textContent = `${first.toFixed(1)}°`;
+    } else {
+      deadzoneValue.textContent = "varies";
+    }
+  } else {
+    const value = deadzonesDeg[Number(selected)] ?? 0.8;
+    deadzoneSlider.value = value;
+    deadzoneValue.textContent = `${value.toFixed(1)}°`;
+  }
+  updateJitterReadout();
+}
+
+function syncMountControls() {
+  mountYawSelect.value = String(mountSettings.yaw_deg);
+  invertYawInput.checked = mountSettings.invert_yaw;
+  invertPitchInput.checked = mountSettings.invert_pitch;
+  invertRollInput.checked = mountSettings.invert_roll;
+}
+
+function sendMountSettings() {
+  mountSettings = {
+    yaw_deg: Number(mountYawSelect.value),
+    invert_yaw: invertYawInput.checked,
+    invert_pitch: invertPitchInput.checked,
+    invert_roll: invertRollInput.checked,
+  };
+  sendCommand({ type: "set_mount", ...mountSettings });
+}
 
 function setStatus() {
   if (connectionState === "connected") {
@@ -226,6 +288,17 @@ let currentSource = "hw";
 
 function applyStatus(m) {
   currentSource = m.src || "hw";
+  if (Array.isArray(m.deadzones_deg) && m.deadzones_deg.length === 11) {
+    deadzonesDeg = m.deadzones_deg;
+    syncDeadzoneControls();
+  }
+  if (m.mount && [0, 90, 180, 270].includes(m.mount.yaw_deg) &&
+      typeof m.mount.invert_yaw === "boolean" &&
+      typeof m.mount.invert_pitch === "boolean" &&
+      typeof m.mount.invert_roll === "boolean") {
+    mountSettings = m.mount;
+    syncMountControls();
+  }
   const t = m.zeroed_at ? new Date(m.zeroed_at * 1000).toLocaleTimeString() : null;
   const who = m.zero_source === "auto" ? "auto" : "manual";
   zeroTxt.textContent = m.zeroed
@@ -244,6 +317,10 @@ function applyPose(p) {
   }
   hzTxt.textContent = p.rate_hz ? p.rate_hz.toFixed(1) : "—";
   setSensors(p.health);
+  if (Array.isArray(p.jitter_deg) && p.jitter_deg.length === 11) {
+    lastJitterDeg = p.jitter_deg;
+    updateJitterReadout();
+  }
   lastPoseAt = performance.now();
   if (connectionState !== "connected") {
     connectionState = "connected";
@@ -266,6 +343,7 @@ function connect() {
     try { m = JSON.parse(ev.data); } catch { return; }
     if (m.type === "pose") applyPose(m);
     else if (m.type === "status") applyStatus(m);
+    else if (m.type === "error") console.warn("Bridge:", m.message);
   };
   ws.onclose = () => {
     connectionState = "offline";
@@ -276,8 +354,22 @@ function connect() {
 }
 
 zeroBtn.addEventListener("click", () => {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "zero" }));
+  sendCommand({ type: "zero" });
 });
+imuSelect.addEventListener("change", syncDeadzoneControls);
+deadzoneSlider.addEventListener("input", () => {
+  const deg = Number(deadzoneSlider.value);
+  deadzoneValue.textContent = `${deg.toFixed(1)}°`;
+  const imu = imuSelect.value === "all" ? "all" : Number(imuSelect.value);
+  sendCommand({ type: "set_deadzone", imu, deg });
+});
+resetDeadzonesBtn.addEventListener("click", () => sendCommand({ type: "reset_deadzones" }));
+mountYawSelect.addEventListener("change", sendMountSettings);
+invertYawInput.addEventListener("change", sendMountSettings);
+invertPitchInput.addEventListener("change", sendMountSettings);
+invertRollInput.addEventListener("change", sendMountSettings);
+syncDeadzoneControls();
+syncMountControls();
 window.addEventListener("keydown", (e) => {
   if (e.key === "c" || e.key === "C") zeroBtn.click();
 });
@@ -293,11 +385,12 @@ function animate(now) {
     fpsEma = fpsEma ? fpsEma + 0.08 * (1 / dt - fpsEma) : 1 / dt;
     if (t % 1 < 0.05) fpsTxt.textContent = fpsEma.toFixed(0);
   }
+  const frameDtMs = lastFrame ? Math.min(now - lastFrame, 100) : 16.67;
   lastFrame = now;
 
   // Frame-rate-independent smoothing; snap on the first pose after a gap.
   const age = now - lastPoseAt;
-  const k = age > 600 ? 1 : 1 - Math.exp(-(now - lastFrame) * 0.018);
+  const k = age > 600 ? 1 : 1 - Math.exp(-frameDtMs * 0.018);
   if (age > 600) lastPoseAt = now;                 // avoid re-snap every frame
 
   hand.quaternion.slerp(targets.hand, k);

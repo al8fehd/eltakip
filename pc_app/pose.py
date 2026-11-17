@@ -112,6 +112,15 @@ class PoseTracker:
     """Builds pose dicts from firmware frames; owns neutral-pose capture."""
 
     def __init__(self, hand_fix=HAND_FIX, auto_zero=True):
+        self.default_deadzone_deg = 0.8
+        self.deadzones_deg = [self.default_deadzone_deg] * protocol.IMU_COUNT
+        self.last_jitter_deg = [0.0] * protocol.IMU_COUNT
+        self._filtered_quats = [None] * protocol.IMU_COUNT
+        self.mount_yaw_deg = 180
+        self.invert_yaw = False
+        self.invert_pitch = False
+        self.invert_roll = False
+        self._mount_basis = self._make_mount_basis(self.mount_yaw_deg)
         self.hand_fix = hand_fix
         self.auto_zero = auto_zero
         self.neutral = {}
@@ -119,6 +128,22 @@ class PoseTracker:
         self.zeroed_at = None
         self.zero_source = None
         self._last_input = None          # (hand_q, seg_rel) of the newest frame
+        self._last_frame = None
+
+    @staticmethod
+    def _make_mount_basis(yaw_deg):
+        base = qaxis_angle(1.0, 0.0, 0.0, -math.pi / 2.0)
+        yaw = qaxis_angle(0.0, 1.0, 0.0, math.radians(yaw_deg))
+        return qnorm(qmul(yaw, base))
+
+    @property
+    def mount(self):
+        return {
+            "yaw_deg": self.mount_yaw_deg,
+            "invert_yaw": self.invert_yaw,
+            "invert_pitch": self.invert_pitch,
+            "invert_roll": self.invert_roll,
+        }
 
     # -- neutral pose -------------------------------------------------------
 
@@ -128,6 +153,74 @@ class PoseTracker:
         self.zeroed = True
         self.zeroed_at = time.time()
         self.zero_source = source
+
+    def set_deadzone(self, imu, deg):
+        """Set one or all per-IMU angular deadzones (degrees)."""
+        if isinstance(deg, bool) or not isinstance(deg, (int, float)):
+            raise ValueError("deadzone must be a number from 0.0 to 5.0 degrees")
+        deg = float(deg)
+        if not math.isfinite(deg) or not 0.0 <= deg <= 5.0:
+            raise ValueError("deadzone must be a number from 0.0 to 5.0 degrees")
+
+        if imu == "all":
+            indices = range(protocol.IMU_COUNT)
+        elif isinstance(imu, int) and not isinstance(imu, bool) and 0 <= imu < protocol.IMU_COUNT:
+            indices = (imu,)
+        else:
+            raise ValueError("imu must be 'all' or an index from 0 to 10")
+        for i in indices:
+            self.deadzones_deg[i] = deg
+
+    def reset_deadzones(self):
+        """Restore the default angular deadzone for every IMU."""
+        self.deadzones_deg = [self.default_deadzone_deg] * protocol.IMU_COUNT
+
+    def set_mount(self, yaw_deg: int, invert_yaw: bool,
+                  invert_pitch: bool, invert_roll: bool):
+        """Set board alignment and re-zero from the latest pose if possible."""
+        if (isinstance(yaw_deg, bool) or not isinstance(yaw_deg, int) or
+                yaw_deg not in (0, 90, 180, 270)):
+            raise ValueError("yaw_deg must be 0, 90, 180, or 270")
+        if any(not isinstance(value, bool) for value in (invert_yaw, invert_pitch, invert_roll)):
+            raise ValueError("mount inversion flags must be booleans")
+
+        updated = (yaw_deg, invert_yaw, invert_pitch, invert_roll)
+        if updated == (self.mount_yaw_deg, self.invert_yaw,
+                       self.invert_pitch, self.invert_roll):
+            return
+
+        was_zeroed = self.zeroed
+        latest_frame = self._last_frame
+        self.mount_yaw_deg = yaw_deg
+        self.invert_yaw = invert_yaw
+        self.invert_pitch = invert_pitch
+        self.invert_roll = invert_roll
+        self._mount_basis = self._make_mount_basis(yaw_deg)
+        self._filtered_quats = [None] * protocol.IMU_COUNT
+        self.last_jitter_deg = [0.0] * protocol.IMU_COUNT
+        self.neutral = {}
+        self.zeroed = False
+        self.zeroed_at = None
+        self.zero_source = None
+        self._last_input = None
+
+        if latest_frame is not None:
+            self.on_frame(latest_frame)
+            if was_zeroed and not self.zeroed and self._last_input is not None:
+                self.capture_neutral(*self._last_input, source="mount")
+
+    def _align_quat(self, q):
+        return qnorm(qmul(qmul(self._mount_basis, q), qinv(self._mount_basis)))
+
+    def _invert_hand_axes(self, q):
+        w, x, y, z = q
+        if self.invert_pitch:
+            x = -x
+        if self.invert_yaw:
+            y = -y
+        if self.invert_roll:
+            z = -z
+        return qnorm((w, x, y, z))
 
     def capture_neutral_from_last(self, source="user"):
         """Re-zero using the newest frame (used by the UI command)."""
@@ -143,11 +236,35 @@ class PoseTracker:
         if frame.ftype != protocol.TYPE_POSE or len(frame.quats) < protocol.IMU_COUNT:
             return None
 
-        hand = qmul(frame.quats[0], self.hand_fix)      # fixed hand orientation, world frame
-        seg_rel = {
-            name: qnorm(qmul(qinv(hand), frame.quats[idx]))
-            for name, idx in SEG_IMU.items()
-        }
+        self._last_frame = frame
+        mask = frame.status
+        filtered_imu_quats = []
+        for i, raw in enumerate(frame.quats[:protocol.IMU_COUNT]):
+            q_raw = qnorm(raw)
+            q_filt = self._filtered_quats[i]
+            if q_filt is None:
+                q_filt = q_raw
+                self.last_jitter_deg[i] = 0.0
+            else:
+                dot = sum(a * b for a, b in zip(q_raw, q_filt))
+                delta_deg = math.degrees(2.0 * math.acos(min(1.0, abs(dot))))
+                self.last_jitter_deg[i] = delta_deg
+                if delta_deg >= self.deadzones_deg[i]:
+                    q_filt = q_raw
+            self._filtered_quats[i] = q_filt
+            filtered_imu_quats.append(q_filt)
+
+        aligned_quats = [self._align_quat(q) for q in filtered_imu_quats]
+        hand_base = qnorm(qmul(aligned_quats[0], self.hand_fix))
+        hand = self._invert_hand_axes(hand_base)
+        seg_rel = {}
+        # Axis inversion changes global palm motion, not finger-local articulation.
+        hand_inv = qinv(hand_base)
+        for f, (lo, hi) in FINGERS.items():
+            q_lo = aligned_quats[lo] if mask[lo] else hand_base
+            q_hi = aligned_quats[hi] if mask[hi] else q_lo
+            seg_rel[f"{f}_lower"] = qnorm(qmul(hand_inv, q_lo))
+            seg_rel[f"{f}_upper"] = qnorm(qmul(hand_inv, q_hi))
         joints = self._joints_of(seg_rel)
         self._last_input = (hand, seg_rel)
 
@@ -161,7 +278,6 @@ class PoseTracker:
                 j = qnorm(qmul(qinv(self.neutral[k]), j))   # neutral^-1 (x) current
             out_joints[k] = {"q": q_to_list(j)}
 
-        mask = frame.status
         faulty = [f"IMU_{i}" for i, ok in enumerate(mask) if not ok]
 
         return {
@@ -173,6 +289,7 @@ class PoseTracker:
             "hand": {"q": q_to_list(hand)},
             "segments": {k: {"q": q_to_list(v)} for k, v in seg_rel.items()},
             "joints": out_joints,
+            "jitter_deg": [round(v, 3) for v in self.last_jitter_deg],
             "health": {"n": sum(mask), "total": protocol.IMU_COUNT, "faulty": faulty},
         }
 

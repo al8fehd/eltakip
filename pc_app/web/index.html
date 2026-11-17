@@ -66,6 +66,26 @@
   button:hover { background: #405a86; }
   button#zeroBtn { background: #0d5c8f; border-color: #7dd3fc; color: #ffffff; }
   button#zeroBtn:hover { background: #1270ab; }
+  #driftPanel { margin-top: 9px; border-top: 1px solid var(--panel-b); padding-top: 7px; }
+  #driftPanel summary { color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; }
+  #driftControls { display: grid; grid-template-columns: auto 1fr; align-items: center;
+                   gap: 7px 10px; margin-top: 8px; min-width: 270px; }
+  #driftControls label { color: var(--muted); font-size: 11px; }
+  #imuSelect { max-width: 190px; background: #101a2e; color: var(--fg);
+               border: 1px solid var(--panel-b); border-radius: 6px; padding: 4px; }
+  #deadzoneRange { display: flex; align-items: center; gap: 7px; }
+  #deadzoneSlider { flex: 1; min-width: 0; accent-color: var(--accent); }
+  #deadzoneValue, #jitterReadout { font-variant-numeric: tabular-nums; color: var(--fg); }
+  #resetDeadzonesBtn { grid-column: 1 / -1; justify-self: start; }
+  #mountControls { display: grid; grid-template-columns: auto 1fr; align-items: center;
+                   gap: 7px 10px; margin-top: 10px; padding-top: 8px;
+                   border-top: 1px solid var(--panel-b); }
+  #mountControls label { color: var(--muted); font-size: 11px; }
+  #mountYaw { max-width: 210px; background: #101a2e; color: var(--fg);
+              border: 1px solid var(--panel-b); border-radius: 6px; padding: 4px; }
+  .mount-inversions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 5px 12px; }
+  .mount-inversions label { display: inline-flex; align-items: center; gap: 4px; }
+  .mount-inversions input { margin: 0; accent-color: var(--accent); }
   kbd { font: 11px ui-monospace, monospace; background: #101a2e; border: 1px solid #58719e;
         border-radius: 5px; padding: 0 5px; margin-left: 6px; }
 
@@ -76,6 +96,7 @@
   #err { position: fixed; inset: 20px; z-index: 50; display: flex; align-items: center;
          justify-content: center; background: rgba(24, 34, 56, 0.96); border-radius: 14px;
          color: var(--err); font-size: 15px; text-align: center; padding: 20px; }
+  #err[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -102,6 +123,48 @@
     <button id="zeroBtn" title="Pin the current hand posture as the straight-hand neutral pose">⟳ Zero / Calibrate Hand<kbd>C</kbd></button>
     <button id="resetBtn" title="Reset camera to the default view">Reset view</button>
   </div>
+  <details id="driftPanel">
+    <summary>Drift &amp; Deadzone</summary>
+    <div id="driftControls">
+      <label for="imuSelect">Sensor</label>
+      <select id="imuSelect">
+        <option value="all">All IMUs (0–10)</option>
+        <option value="0">IMU_0</option>
+        <option value="1">IMU_1</option>
+        <option value="2">IMU_2</option>
+        <option value="3">IMU_3</option>
+        <option value="4">IMU_4</option>
+        <option value="5">IMU_5</option>
+        <option value="6">IMU_6</option>
+        <option value="7">IMU_7</option>
+        <option value="8">IMU_8</option>
+        <option value="9">IMU_9</option>
+        <option value="10">IMU_10</option>
+      </select>
+      <label for="deadzoneSlider">Deadzone</label>
+      <div id="deadzoneRange">
+        <input id="deadzoneSlider" type="range" min="0" max="5" step="0.1" value="0.8">
+        <span id="deadzoneValue">0.8°</span>
+      </div>
+      <label for="jitterReadout">Angular delta</label>
+      <span id="jitterReadout">0.00°</span>
+      <button id="resetDeadzonesBtn" type="button">Reset Deadzones</button>
+    </div>
+    <div id="mountControls">
+      <label for="mountYaw">Board orientation</label>
+      <select id="mountYaw">
+        <option value="180">USB → Wrist (180°)</option>
+        <option value="0">USB → Fingers (0°)</option>
+        <option value="90">USB → Left (90°)</option>
+        <option value="270">USB → Right (270°)</option>
+      </select>
+      <div class="mount-inversions">
+        <label><input id="invertYaw" type="checkbox">Invert Yaw</label>
+        <label><input id="invertRoll" type="checkbox">Invert Roll</label>
+        <label><input id="invertPitch" type="checkbox">Invert Pitch</label>
+      </div>
+    </div>
+  </details>
 </div>
 
 <div id="hint">drag — orbit &nbsp;·&nbsp; wheel — zoom</div>

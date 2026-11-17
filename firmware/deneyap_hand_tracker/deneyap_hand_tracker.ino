@@ -32,6 +32,8 @@
 #include <Wire.h>
 #include <math.h>
 
+struct SensorNode;
+
 // ----------------------------------------------------------------------------
 // Configuration
 // ----------------------------------------------------------------------------
@@ -46,6 +48,8 @@ static const uint32_t SERIAL_BAUD   = 921600UL;
 static const uint32_t STREAM_PERIOD_MS = 10;      // 100 Hz target (50-100 Hz stream rate)
 static const uint16_t CALIB_SAMPLES    = 256;     // resting samples per IMU at boot
 static const float    MADGWICK_BETA    = 0.10f;   // fusion gain: 0.05 calmer, 0.2 snappier
+static const float    GYRO_DEADZONE_RAD = 0.022f;
+static const uint8_t  ZUPT_STILL_TICKS  = 40;
 
 // MPU6050 ranges: accel +/-4g (8192 LSB/g), gyro +/-2000 deg/s (16.4 LSB/(deg/s))
 static const uint8_t  MPU_I2C_ADDR = 0x68;        // AD0 tied low on every module
@@ -229,6 +233,8 @@ struct SensorNode {
 
   int16_t  gyrBias[3] = {0, 0, 0};         // raw LSB offsets
   int16_t  accBias[3] = {0, 0, 0};         // raw LSB offsets (includes gravity, see calib)
+  float    gyrBiasF[3] = {0.0f, 0.0f, 0.0f}; // adaptive bias in rad/s
+  uint8_t  quietTicks = 0;
 
   float    q[4] = {1.0f, 0.0f, 0.0f, 0.0f};
 };
@@ -263,7 +269,7 @@ class TxRing {
   }
 
   // Write as much as the driver accepts in one call; never blocks.
-  void drain(HardwareSerial& ser) {
+  void drain(Stream& ser) {
     size_t free = ser.availableForWrite();
     while (pending_ && free) {
       size_t k = pending_ < free ? pending_ : free;
@@ -343,12 +349,10 @@ static void sendLog(const char* text) {
 
 // ----------------------------------------------------------------------------
 // Startup resting calibration: CALIB_SAMPLES taken per IMU while the sensor
-// reports a plausibly still signal; the means become bias offsets.
-//  - gyro bias : mean raw rate (should be ~0)
-//  - accel bias: mean raw vector. At rest this equals gravity + constant
-//    offset; subtracting it leaves the dynamic part, which the fusion uses
-//    purely as a gravity direction. (Glove segments rest under gravity, so
-//    this is the standard zero-tilt calibration for every mounting pose.)
+// reports a plausibly still signal.
+//  - gyro bias : mean raw rate (should be ~0), subtracted before fusion
+//  - accel mean: recorded for diagnostics; never subtracted because the
+//    fusion filter needs the measured 1g gravity direction.
 // ----------------------------------------------------------------------------
 static bool calibrateNode(SensorNode& node) {
   if (!node.mux->select(node.ch)) return false;
@@ -358,7 +362,11 @@ static bool calibrateNode(SensorNode& node) {
   int16_t acc[3], gyr[3];
 
   for (uint16_t tries = 0; tries < 4096 && took < CALIB_SAMPLES; tries++) {
+    delay(5);
     if (!node.imu.readRaw(acc, gyr)) continue;         // will fail -> node marked bad
+    if (gyr[0] < -250 || gyr[0] > 250 ||
+        gyr[1] < -250 || gyr[1] > 250 ||
+        gyr[2] < -250 || gyr[2] > 250) continue;
     // Stillness gate: |a| within +/-25% of 1 g (0.56g^2 .. 1.56g^2 in LSB^2).
     int64_t a2 = (int64_t)acc[0] * acc[0] + (int64_t)acc[1] * acc[1] + (int64_t)acc[2] * acc[2];
     if (a2 < 37100000LL || a2 > 105000000LL) continue;
@@ -371,6 +379,7 @@ static bool calibrateNode(SensorNode& node) {
     for (uint8_t i = 0; i < 3; i++) {
       node.gyrBias[i] = (int16_t)(gs[i] / (int32_t)took);
       node.accBias[i] = (int16_t)(as[i] / (int32_t)took);
+      node.gyrBiasF[i] = node.gyrBias[i] * GYR_STEP_RAD;
     }
   }
   node.mux->deselect();
@@ -386,7 +395,7 @@ static uint32_t frameCount_ = 0;
 // ----------------------------------------------------------------------------
 void setup() {
   Serial.begin(SERIAL_BAUD);
-  delay(200);                                  // one-time boot pause, not in the stream loop
+  delay(800);                                  // let USB plug-in vibrations settle before calibration
 
   Wire.begin(PIN_SDA, PIN_SCL, I2C_CLK_HZ);
 
@@ -462,6 +471,7 @@ static void streamTick() {
 
     if (!n.mux->select(n.ch) || !n.imu.readRaw(acc, gyr)) {
       n.mux->deselect();
+      n.quietTicks = 0;
       if (++n.failStreak >= MAX_FAIL_STREAK) {
         n.failStreak = 0;
         if (n.ok) {
@@ -486,12 +496,33 @@ static void streamTick() {
     else       statusHi |= (uint8_t)(1u << (i - 8));
 
     // Bias-corrected, scaled units: accel in g, gyro in rad/s.
-    float ax = (acc[0] - n.accBias[0]) * ACC_STEP;
-    float ay = (acc[1] - n.accBias[1]) * ACC_STEP;
-    float az = (acc[2] - n.accBias[2]) * ACC_STEP;
-    float gx = (gyr[0] - n.gyrBias[0]) * GYR_STEP_RAD;
-    float gy = (gyr[1] - n.gyrBias[1]) * GYR_STEP_RAD;
-    float gz = (gyr[2] - n.gyrBias[2]) * GYR_STEP_RAD;
+    float ax = acc[0] * ACC_STEP;
+    float ay = acc[1] * ACC_STEP;
+    float az = acc[2] * ACC_STEP;
+    float rawGx = gyr[0] * GYR_STEP_RAD;
+    float rawGy = gyr[1] * GYR_STEP_RAD;
+    float rawGz = gyr[2] * GYR_STEP_RAD;
+    float gx = rawGx - n.gyrBiasF[0];
+    float gy = rawGy - n.gyrBiasF[1];
+    float gz = rawGz - n.gyrBiasF[2];
+    float aMag = sqrtf(ax * ax + ay * ay + az * az);
+    if (fabsf(gx) < GYRO_DEADZONE_RAD && fabsf(gy) < GYRO_DEADZONE_RAD &&
+        fabsf(gz) < GYRO_DEADZONE_RAD && aMag >= 0.88f && aMag <= 1.12f) {
+      if (n.quietTicks <= ZUPT_STILL_TICKS) n.quietTicks++;
+      if (n.quietTicks > ZUPT_STILL_TICKS) {
+        n.gyrBiasF[0] = 0.995f * n.gyrBiasF[0] + 0.005f * rawGx;
+        n.gyrBiasF[1] = 0.995f * n.gyrBiasF[1] + 0.005f * rawGy;
+        n.gyrBiasF[2] = 0.995f * n.gyrBiasF[2] + 0.005f * rawGz;
+        gx = rawGx - n.gyrBiasF[0];
+        gy = rawGy - n.gyrBiasF[1];
+        gz = rawGz - n.gyrBiasF[2];
+      }
+    } else {
+      n.quietTicks = 0;
+    }
+    if (fabsf(gx) < GYRO_DEADZONE_RAD) gx = 0.0f;
+    if (fabsf(gy) < GYRO_DEADZONE_RAD) gy = 0.0f;
+    if (fabsf(gz) < GYRO_DEADZONE_RAD) gz = 0.0f;
 
     n.filt.updateAG(gx, gy, gz, ax, ay, az, dt, MADGWICK_BETA);
     for (uint8_t k = 0; k < 4; k++) n.q[k] = n.filt.q[k];

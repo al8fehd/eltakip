@@ -1,0 +1,11 @@
+# Python virtual environment and bytecode
+pc_app/.venv/
+__pycache__/
+*.pyc
+
+# PlatformIO build output
+.pio/
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
