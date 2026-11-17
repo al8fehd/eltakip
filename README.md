@@ -1,0 +1,2 @@
+# eltakip
+deneyap mezuniyet projesi
