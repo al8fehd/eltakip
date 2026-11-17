@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deneyap Hand Tracker — Phase 1</title>
+<style>
+  :root {
+    --bg:      #1d2b45;
+    --panel:   rgba(28, 40, 66, 0.95);
+    --panel-b: #52688f;
+    --fg:      #f8fafc;
+    --muted:   #c9d6ea;
+    --ok:      #4ade80;
+    --err:     #f87171;
+    --warn:    #fbbf24;
+    --accent:  #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg);
+               color: var(--fg); font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; }
+
+  #hud {
+    position: fixed; top: 14px; left: 14px; z-index: 10;
+    background: var(--panel); border: 1px solid var(--panel-b); border-radius: 12px;
+    padding: 12px 14px; min-width: 300px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(6px); user-select: none;
+  }
+  .brand { font-size: 13px; letter-spacing: .12em; color: var(--muted); }
+  .brand b { color: var(--fg); letter-spacing: .08em; }
+  .phase { margin-left: 8px; font-size: 10px; color: var(--accent);
+           border: 1px solid var(--accent); border-radius: 99px; padding: 1px 8px; }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .sep { width: 1px; height: 14px; background: var(--panel-b); }
+  .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+  .unit { font-size: 11px; color: var(--muted); }
+  .val { font-variant-numeric: tabular-nums; font-size: 15px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--err);
+         box-shadow: 0 0 8px var(--err); }
+  .dot.on  { background: var(--ok); box-shadow: 0 0 8px var(--ok); animation: pulse 2s infinite; }
+  .dot.mid { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  @keyframes pulse { 50% { opacity: .45; } }
+
+  #imuChips { display: flex; gap: 3px; }
+  .chip { width: 16px; height: 16px; border-radius: 4px; background: #4a5d80; position: relative; }
+  .chip.ok  { background: var(--ok); }
+  .chip.bad { background: var(--err); }
+  .chip:hover::after {
+    content: attr(data-name); position: absolute; bottom: 20px; left: 50%;
+    transform: translateX(-50%); background: #0b1220; border: 1px solid var(--panel-b);
+    padding: 2px 8px; border-radius: 6px; font-size: 11px; white-space: nowrap; z-index: 20;
+  }
+  .count { font-variant-numeric: tabular-nums; color: var(--ok); }
+  .count.warn { color: var(--warn); }
+  .count.bad  { color: var(--err); }
+
+  #zeroTxt { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  button {
+    background: #33486b; color: #ffffff; border: 1px solid #58719e; border-radius: 8px;
+    padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover { background: #405a86; }
+  button#zeroBtn { background: #0d5c8f; border-color: #7dd3fc; color: #ffffff; }
+  button#zeroBtn:hover { background: #1270ab; }
+  kbd { font: 11px ui-monospace, monospace; background: #101a2e; border: 1px solid #58719e;
+        border-radius: 5px; padding: 0 5px; margin-left: 6px; }
+
+  #hint { position: fixed; right: 14px; bottom: 12px; z-index: 10;
+          color: #dbe6f5; font-size: 12px; background: var(--panel);
+          border: 1px solid var(--panel-b); border-radius: 99px; padding: 5px 12px; }
+
+  #err { position: fixed; inset: 20px; z-index: 50; display: flex; align-items: center;
+         justify-content: center; background: rgba(24, 34, 56, 0.96); border-radius: 14px;
+         color: var(--err); font-size: 15px; text-align: center; padding: 20px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="brand">DENEYAP <b>HAND TRACKER</b><span class="phase">PHASE 1</span></div>
+  <div class="row">
+    <span class="dot" id="dot"></span>
+    <span id="statusTxt" class="val">OFFLINE</span>
+    <span class="sep"></span><span class="lbl">stream</span>
+    <span id="hzTxt" class="val">—</span><span class="unit">Hz</span>
+    <span class="sep"></span><span class="lbl">render</span>
+    <span id="fpsTxt" class="val">—</span><span class="unit">FPS</span>
+  </div>
+  <div class="row">
+    <span class="lbl">sensors</span>
+    <span id="imuCount" class="count">0/11</span>
+    <div id="imuChips"></div>
+  </div>
+  <div class="row">
+    <span class="lbl">neutral</span>
+    <span id="zeroTxt">not captured</span>
+  </div>
+  <div class="row">
+    <button id="zeroBtn" title="Pin the current hand posture as the straight-hand neutral pose">⟳ Zero / Calibrate Hand<kbd>C</kbd></button>
+    <button id="resetBtn" title="Reset camera to the default view">Reset view</button>
+  </div>
+</div>
+
+<div id="hint">drag — orbit &nbsp;·&nbsp; wheel — zoom</div>
+<div id="err" hidden></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

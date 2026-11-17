@@ -1,0 +1,5 @@
+# Deneyap Hand Tracker — Phase 1 PC bridge
+# Install into a venv first:  python3 -m venv .venv && source .venv/bin/activate
+#                            pip install -r requirements.txt
+pyserial>=3.5
+websockets>=13.0
